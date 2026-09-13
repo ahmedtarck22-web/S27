@@ -111,11 +111,40 @@ class ActivityARPermissionHandler(
         })
     }
 
-    override fun checkARCoreAvailability(): ArCoreApk.Availability =
-        ArCoreApk.getInstance().checkAvailability(activity)
+    override fun checkARCoreAvailability(): ArCoreApk.Availability {
+        val isInstalled = runCatching {
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+                activity.packageManager.getPackageInfo("com.google.ar.core", PackageManager.PackageInfoFlags.of(0))
+            } else {
+                @Suppress("DEPRECATION")
+                activity.packageManager.getPackageInfo("com.google.ar.core", 0)
+            }
+            true
+        }.getOrDefault(false)
 
-    override fun requestARCoreInstall(userRequestedInstall: Boolean): Boolean =
-        ArCoreApk.getInstance().requestInstall(
-            activity, userRequestedInstall
-        ) == ArCoreApk.InstallStatus.INSTALL_REQUESTED
+        return if (isInstalled) {
+            ArCoreApk.Availability.SUPPORTED_INSTALLED
+        } else {
+            ArCoreApk.Availability.SUPPORTED_NOT_INSTALLED
+        }
+    }
+
+    override fun requestARCoreInstall(userRequestedInstall: Boolean): Boolean {
+        val isInstalled = runCatching {
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+                activity.packageManager.getPackageInfo("com.google.ar.core", PackageManager.PackageInfoFlags.of(0))
+            } else {
+                @Suppress("DEPRECATION")
+                activity.packageManager.getPackageInfo("com.google.ar.core", 0)
+            }
+            true
+        }.getOrDefault(false)
+        if (isInstalled) return false
+
+        return runCatching {
+            ArCoreApk.getInstance().requestInstall(
+                activity, userRequestedInstall
+            ) == ArCoreApk.InstallStatus.INSTALL_REQUESTED
+        }.getOrDefault(false)
+    }
 }

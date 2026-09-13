@@ -1,0 +1,6 @@
+{
+  "name": "Mixed Reality",
+  "description": "Mixed Reality, AR, and 3D Object viewer powered by SceneView",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
