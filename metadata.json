@@ -1,6 +1,6 @@
 {
-  "name": "Mixed Reality",
-  "description": "Mixed Reality, AR, and 3D Object viewer powered by SceneView",
+  "name": "MIXED REALITY",
+  "description": "Mixed Reality, AR, and 3D Object viewer powered by SceneView and Filament",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

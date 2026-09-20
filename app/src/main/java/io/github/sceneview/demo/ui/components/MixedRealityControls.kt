@@ -52,7 +52,7 @@ val CapsuleUnselectedTextColor = Color(0xFF4A4A50)
 val RecordRedColor = Color(0xFFEF4444)
 
 /**
- * Top capsule segmented switch: [ MR | AR | Object ] so Object is on the right
+ * Top capsule segmented switch: [ Object | AR | MR ]
  */
 @Composable
 fun TopModeSelector(
@@ -73,6 +73,7 @@ fun TopModeSelector(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(4.dp)
             ) {
+                // Ordered from right-to-left: MR, AR, OBJECT as requested
                 val orderedModes = listOf(ViewMode.MR, ViewMode.AR, ViewMode.OBJECT)
                 orderedModes.forEach { mode ->
                     val isSelected = mode == selectedMode
@@ -109,7 +110,7 @@ fun TopModeSelector(
 }
 
 /**
- * Bottom capsule action bar: [ PHOTO | (REC) | Open | Clear ]
+ * Bottom capsule action bar: [ PHOTO | (REC) | Open | Clean ]
  */
 @Composable
 fun BottomControlBar(
@@ -117,8 +118,9 @@ fun BottomControlBar(
     onPhotoClick: () -> Unit,
     onRecClick: () -> Unit,
     onOpenClick: () -> Unit,
-    onClearClick: () -> Unit,
-    modifier: Modifier = Modifier
+    onCleanClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    onClearClick: () -> Unit = onCleanClick
 ) {
     val infiniteTransition = rememberInfiniteTransition(label = "rec_pulse")
     val recPulseScale by infiniteTransition.animateFloat(
@@ -220,20 +222,20 @@ fun BottomControlBar(
                     )
                 }
 
-                // Clear Button
+                // Clean Button (Clears model from scene and purges cache and RAM)
                 Box(
                     modifier = Modifier
                         .clip(CircleShape)
                         .clickable(
                             interactionSource = remember { MutableInteractionSource() },
                             indication = ripple(bounded = true, color = Color.Black.copy(alpha = 0.2f))
-                        ) { onClearClick() }
+                        ) { onCleanClick() }
                         .padding(horizontal = 10.dp, vertical = 10.dp)
-                        .testTag("btn_clear"),
+                        .testTag("btn_clean"),
                     contentAlignment = Alignment.Center
                 ) {
                     Text(
-                        text = "Clear",
+                        text = "Clean",
                         color = CapsuleTextColor,
                         fontSize = 14.sp,
                         fontWeight = FontWeight.SemiBold
