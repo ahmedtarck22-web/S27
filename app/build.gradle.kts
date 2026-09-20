@@ -75,4 +75,5 @@ dependencies {
 
     implementation("io.github.sceneview:sceneview:4.6.2")
     implementation("io.github.sceneview:arsceneview:4.6.2")
+    implementation(libs.arcore)
 }
