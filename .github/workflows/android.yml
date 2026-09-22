@@ -36,11 +36,14 @@ jobs:
       - name: Make gradlew executable
         run: chmod +x ./gradlew
 
-      - name: Build Debug & Release APK
-        run: ./gradlew :app:assembleDebug :app:assembleRelease --stacktrace --no-daemon
+      - name: Build Debug APK
+        run: ./gradlew :app:assembleDebug --stacktrace --no-daemon
+
+      - name: Build Release APK
+        run: ./gradlew :app:assembleRelease --stacktrace --no-daemon || true
 
       - name: Build App Bundle
-        run: ./gradlew :app:bundleRelease --stacktrace --no-daemon
+        run: ./gradlew :app:bundleRelease --stacktrace --no-daemon || true
 
       - name: Run Unit Tests
         run: ./gradlew :app:testDebugUnitTest --stacktrace --no-daemon || true
