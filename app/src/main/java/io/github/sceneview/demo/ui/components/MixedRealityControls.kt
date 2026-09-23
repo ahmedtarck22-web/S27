@@ -8,6 +8,7 @@ import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
@@ -45,11 +46,64 @@ enum class ViewMode(val label: String) {
     MR("MR")
 }
 
+enum class RotationMode(val label: String) {
+    FREE("X & Y Axes (Free)"),
+    X_AXIS("X-Axis Only")
+}
+
 val CapsuleBgColor = Color(0xFFCACACC)
 val CapsuleSelectedColor = Color(0xFFA0A0A5)
 val CapsuleTextColor = Color(0xFF1E1E20)
 val CapsuleUnselectedTextColor = Color(0xFF4A4A50)
 val RecordRedColor = Color(0xFFEF4444)
+
+/**
+ * Switch button between 'Free Rotate' and 'X-Axis Only' rotation modes
+ */
+@Composable
+fun RotationModeSwitch(
+    rotationMode: RotationMode,
+    onToggle: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
+        Box(
+            modifier = modifier
+                .clip(CircleShape)
+                .background(Color(0xCC0E141E))
+                .border(
+                    width = 1.dp,
+                    color = if (rotationMode == RotationMode.FREE) Color(0xFF00E5FF) else Color(0xFFFFB300),
+                    shape = CircleShape
+                )
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = ripple(bounded = true, color = Color.White.copy(alpha = 0.2f))
+                ) { onToggle() }
+                .padding(horizontal = 14.dp, vertical = 7.dp)
+                .testTag("btn_rotation_mode_toggle"),
+            contentAlignment = Alignment.Center
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(8.dp)
+                        .clip(CircleShape)
+                        .background(if (rotationMode == RotationMode.FREE) Color(0xFF00E5FF) else Color(0xFFFFB300))
+                )
+                Text(
+                    text = rotationMode.label,
+                    color = Color(0xFFE2F3FF),
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
+        }
+    }
+}
 
 /**
  * Top capsule segmented switch: [ Object | AR | MR ]

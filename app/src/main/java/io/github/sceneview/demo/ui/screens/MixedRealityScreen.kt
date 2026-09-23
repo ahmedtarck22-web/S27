@@ -115,6 +115,8 @@ import io.github.sceneview.ar.arcore.createAnchorOrNull
 import io.github.sceneview.ar.arcore.getUpdatedPlanes
 import io.github.sceneview.ar.node.AnchorNode
 import io.github.sceneview.demo.ui.components.BottomControlBar
+import io.github.sceneview.demo.ui.components.RotationMode
+import io.github.sceneview.demo.ui.components.RotationModeSwitch
 import io.github.sceneview.demo.ui.components.SceneObject
 import io.github.sceneview.demo.ui.components.TopModeSelector
 import io.github.sceneview.demo.ui.components.ViewMode
@@ -154,6 +156,7 @@ fun MixedRealityScreen() {
     // Exact 3 modes: Object, AR, MR
     var currentMode by remember { mutableStateOf(ViewMode.OBJECT) }
     var selectedObject by remember { mutableStateOf<SceneObject?>(SceneObject.DefaultModel) }
+    var rotationMode by remember { mutableStateOf(RotationMode.FREE) }
 
     // Controls and reset counter
     var resetCounter by remember { mutableIntStateOf(0) }
@@ -334,6 +337,7 @@ fun MixedRealityScreen() {
                     isAutoRotateEnabled = isAutoRotateEnabled,
                     isAnimationPlaying = isAnimationPlaying,
                     isScaleLocked = isScaleLockEnabled,
+                    rotationMode = rotationMode,
                     resetKey = resetCounter,
                     onFrameRendered = { frameCount++ }
                 )
@@ -354,6 +358,7 @@ fun MixedRealityScreen() {
                         selectedObject = selectedObject,
                         hasCameraPermission = hasCameraPermission,
                         isScaleLocked = isScaleLockEnabled,
+                        rotationMode = rotationMode,
                         resetKey = resetCounter,
                         onFrameRendered = { frameCount++ },
                         onLogEvent = { cat, msg -> addLog(cat, msg) }
@@ -378,6 +383,7 @@ fun MixedRealityScreen() {
                         ipdMm = stereoIpdMm,
                         fovDeg = stereoFovDeg,
                         isScaleLocked = isScaleLockEnabled,
+                        rotationMode = rotationMode,
                         resetKey = resetCounter,
                         onFrameRendered = { frameCount++ }
                     )
@@ -388,12 +394,15 @@ fun MixedRealityScreen() {
         // ==========================================
         // TOP HEADER (TopModeSelector & Action Icons)
         // ==========================================
+        // Mode Selector and Rotation Mode in the Top Header
         val topPadding = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
-        Box(
+        Column(
             modifier = Modifier
                 .align(Alignment.TopCenter)
                 .fillMaxWidth()
-                .padding(top = topPadding + 10.dp, start = 16.dp, end = 16.dp)
+                .padding(top = topPadding + 10.dp, start = 16.dp, end = 16.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             // Mode Selector in the center
             TopModeSelector(
@@ -404,11 +413,19 @@ fun MixedRealityScreen() {
                     if ((mode == ViewMode.AR || mode == ViewMode.MR) && !hasCameraPermission) {
                         permissionLauncher.launch(Manifest.permission.CAMERA)
                     }
-                },
-                modifier = Modifier.align(Alignment.Center)
+                }
             )
 
-            // Top header bar centered on mode selector without unrequested corner action buttons
+            // Rotation Mode Toggle Button: Free Rotate vs X-Axis Only
+            RotationModeSwitch(
+                rotationMode = rotationMode,
+                onToggle = {
+                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                    rotationMode = if (rotationMode == RotationMode.FREE) RotationMode.X_AXIS else RotationMode.FREE
+                    bannerMessage = "Rotation: ${rotationMode.label}"
+                    addLog("ROTATION", "Switched rotation mode to ${rotationMode.label}")
+                }
+            )
         }
 
         // Recording Active Indicator
@@ -419,7 +436,7 @@ fun MixedRealityScreen() {
                 border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFFEF4444)),
                 modifier = Modifier
                     .align(Alignment.TopCenter)
-                    .padding(top = topPadding + 62.dp)
+                    .padding(top = topPadding + 96.dp)
             ) {
                 Row(
                     modifier = Modifier.padding(horizontal = 14.dp, vertical = 5.dp),
@@ -505,7 +522,7 @@ fun MixedRealityScreen() {
             exit = fadeOut(tween(200)) + slideOutVertically(tween(200)) { -it },
             modifier = Modifier
                 .align(Alignment.TopCenter)
-                .padding(top = topPadding + 64.dp)
+                .padding(top = topPadding + 96.dp)
         ) {
             bannerMessage?.let { msg ->
                 Surface(
@@ -617,6 +634,7 @@ private fun ObjectViewport(
     isAutoRotateEnabled: Boolean,
     isAnimationPlaying: Boolean,
     isScaleLocked: Boolean,
+    rotationMode: RotationMode,
     resetKey: Int,
     onFrameRendered: () -> Unit
 ) {
@@ -668,11 +686,16 @@ private fun ObjectViewport(
                     } else {
                         selectedObject.defaultScale * 0.35f * objectScaleMultiplier
                     }
+                    val effectiveRotation = if (rotationMode == RotationMode.X_AXIS) {
+                        Rotation(objectRotationX, 0f, 0f)
+                    } else {
+                        Rotation(objectRotationX, objectRotationY, 0f)
+                    }
                     ModelNode(
                         modelInstance = instance,
-                        position = Position(objectPanX, objectPanY - 0.05f, 0f),
+                        position = Position(0f, -0.05f, 0f),
                         scaleToUnits = effectiveScale,
-                        rotation = Rotation(objectRotationX, objectRotationY, 0f),
+                        rotation = effectiveRotation,
                         autoAnimate = isAnimationPlaying
                     )
                 }
@@ -695,20 +718,43 @@ private fun ObjectViewport(
             }
         }
 
-        // Gesture Overlay: Free 3D orbit rotation, pan, and pinch-to-scale
+        // Gesture Overlay: 1 finger drag rotates model. 2 fingers pinch scales/magnifies. Moving/panning removed.
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .pointerInput(resetKey) {
+                .pointerInput(resetKey, rotationMode) {
                     detectTransformGestures { _, pan, zoom, _ ->
-                        if (!isScaleLocked) {
+                        // 2-finger pinch to scale / magnify
+                        if (!isScaleLocked && zoom != 1.0f) {
                             objectScaleMultiplier = (objectScaleMultiplier * zoom).coerceIn(0.15f, 5.0f)
                         }
-                        objectRotationY = (objectRotationY + pan.x * 0.5f) % 360f
-                        objectRotationX = (objectRotationX + pan.y * 0.5f).coerceIn(-85f, 85f)
-                        objectPanX = (objectPanX + pan.x * 0.0015f).coerceIn(-1.5f, 1.5f)
-                        objectPanY = (objectPanY - pan.y * 0.0015f).coerceIn(-1.5f, 1.5f)
+                        if (rotationMode == RotationMode.X_AXIS) {
+                            // 1-finger vertical drag rotates model full 360 degrees strictly on the X axis (pitch rotation)
+                            if (pan.y != 0f) {
+                                objectRotationX = (objectRotationX + pan.y * 0.7f) % 360f
+                            }
+                        } else {
+                            // Free Rotate: full 360 degrees on both X (vertical drag) and Y (horizontal drag)
+                            if (pan.y != 0f) {
+                                objectRotationX = (objectRotationX + pan.y * 0.7f) % 360f
+                            }
+                            if (pan.x != 0f) {
+                                objectRotationY = (objectRotationY + pan.x * 0.7f) % 360f
+                            }
+                        }
                     }
+                }
+                .pointerInput(resetKey) {
+                    detectTapGestures(
+                        onDoubleTap = {
+                            // Factory reset gestures: restore scale to 1.0 and rotation to 0
+                            objectScaleMultiplier = 1.0f
+                            objectRotationX = 0f
+                            objectRotationY = 0f
+                            objectPanX = 0f
+                            objectPanY = 0f
+                        }
+                    )
                 }
         )
     }
@@ -728,12 +774,14 @@ private fun ARViewport(
     selectedObject: SceneObject?,
     hasCameraPermission: Boolean,
     isScaleLocked: Boolean,
+    rotationMode: RotationMode,
     resetKey: Int,
     onFrameRendered: () -> Unit,
     onLogEvent: (String, String) -> Unit
 ) {
     var modelScaleMultiplier by remember(resetKey) { mutableFloatStateOf(1.0f) }
     var modelRotationAngle by remember(resetKey) { mutableFloatStateOf(0f) }
+    var modelPitchAngle by remember(resetKey) { mutableFloatStateOf(0f) }
     var modelPositionX by remember(resetKey) { mutableFloatStateOf(0f) }
     var modelPositionY by remember(resetKey) { mutableFloatStateOf(0f) }
     var isAnchored by remember(resetKey) { mutableStateOf(true) }
@@ -766,13 +814,15 @@ private fun ARViewport(
                 planeRenderer = true,
                 sessionConfiguration = { _, config ->
                     config.planeFindingMode = Config.PlaneFindingMode.HORIZONTAL_AND_VERTICAL
-                    config.depthMode = Config.DepthMode.AUTOMATIC
+                    runCatching {
+                        config.depthMode = Config.DepthMode.AUTOMATIC
+                    }
                     config.lightEstimationMode = Config.LightEstimationMode.ENVIRONMENTAL_HDR
                 },
                 onSessionFailed = { exception ->
                     arCoreFailed = true
-                    arCoreErrorMessage = exception.localizedMessage ?: "ARCore unavailable"
-                    onLogEvent("AR", "ARCore session failed: $arCoreErrorMessage; fallback active")
+                    arCoreErrorMessage = exception.localizedMessage ?: "ARCore unavailable on this device"
+                    onLogEvent("AR", "ARCore session failed: $arCoreErrorMessage; active camera passthrough mode")
                 },
                 onTrackingFailureChanged = { reason ->
                     trackingStatusText = when (reason) {
@@ -821,11 +871,16 @@ private fun ARViewport(
                             } else {
                                 (selectedObject?.defaultScale ?: 0.35f) * 0.35f * modelScaleMultiplier
                             }
+                            val effectiveRotation = if (rotationMode == RotationMode.X_AXIS) {
+                                Rotation(modelPitchAngle, 0f, 0f)
+                            } else {
+                                Rotation(modelPitchAngle, modelRotationAngle, 0f)
+                            }
                             ModelNode(
                                 modelInstance = instance,
                                 position = Position(modelPositionX, modelPositionY, 0f),
                                 scaleToUnits = effectiveScale,
-                                rotation = Rotation(0f, modelRotationAngle, 0f),
+                                rotation = effectiveRotation,
                                 autoAnimate = true
                             )
                         }
@@ -863,11 +918,16 @@ private fun ARViewport(
                         } else {
                             selectedObject.defaultScale * 0.35f * modelScaleMultiplier
                         }
+                        val effectiveRotation = if (rotationMode == RotationMode.X_AXIS) {
+                            Rotation(modelPitchAngle, 0f, 0f)
+                        } else {
+                            Rotation(modelPitchAngle, modelRotationAngle, 0f)
+                        }
                         ModelNode(
                             modelInstance = instance,
                             position = Position(modelPositionX, modelPositionY - 0.05f, 0f),
                             scaleToUnits = effectiveScale,
-                            rotation = Rotation(0f, modelRotationAngle, 0f),
+                            rotation = effectiveRotation,
                             autoAnimate = true
                         )
                     }
@@ -879,7 +939,7 @@ private fun ARViewport(
         Surface(
             modifier = Modifier
                 .align(Alignment.TopCenter)
-                .padding(top = 80.dp),
+                .padding(top = 110.dp),
             shape = RoundedCornerShape(20.dp),
             color = Color(0xCC0E141E)
         ) {
@@ -888,14 +948,19 @@ private fun ARViewport(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
+                val chipStatusColor = when {
+                    arCoreFailed -> Color(0xFF00E5FF)
+                    detectedPlanesCount > 0 -> Color(0xFF00E5FF)
+                    else -> Color(0xFFFFB300)
+                }
                 Box(
                     modifier = Modifier
                         .size(8.dp)
                         .clip(CircleShape)
-                        .background(if (detectedPlanesCount > 0) Color(0xFF00E5FF) else Color(0xFFFFB300))
+                        .background(chipStatusColor)
                 )
                 Text(
-                    text = if (arCoreFailed) "Camera Pass-Through Active (Fallback Mode)" else trackingStatusText,
+                    text = if (arCoreFailed) "Camera Pass-Through Active" else trackingStatusText,
                     color = Color(0xFFE2F3FF),
                     fontSize = 12.sp,
                     fontWeight = FontWeight.Medium
@@ -903,25 +968,48 @@ private fun ARViewport(
             }
         }
 
-        // Gesture Overlay for AR: Scale, Rotate, Pan, and Tap to place
+        // Gesture Overlay for AR: 1 finger drag rotates model. 2 fingers pinch scales/magnifies. Moving/panning removed. Double-tap to factory reset.
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .pointerInput(resetKey) {
+                .pointerInput(resetKey, rotationMode) {
                     detectTransformGestures { _, pan, zoom, _ ->
-                        if (!isScaleLocked) {
+                        // 2-finger pinch to scale / magnify
+                        if (!isScaleLocked && zoom != 1.0f) {
                             modelScaleMultiplier = (modelScaleMultiplier * zoom).coerceIn(0.1f, 6.0f)
                         }
-                        modelRotationAngle = (modelRotationAngle + pan.x * 0.4f) % 360f
-                        modelPositionX = (modelPositionX + pan.x * 0.002f).coerceIn(-1.5f, 1.5f)
-                        modelPositionY = (modelPositionY - pan.y * 0.002f).coerceIn(-1.5f, 1.5f)
+                        if (rotationMode == RotationMode.X_AXIS) {
+                            // 1-finger vertical drag rotates model full 360 degrees strictly on the X axis
+                            if (pan.y != 0f) {
+                                modelPitchAngle = (modelPitchAngle + pan.y * 0.7f) % 360f
+                            }
+                        } else {
+                            // Free Rotate: full 360 degrees on both axes
+                            if (pan.y != 0f) {
+                                modelPitchAngle = (modelPitchAngle + pan.y * 0.7f) % 360f
+                            }
+                            if (pan.x != 0f) {
+                                modelRotationAngle = (modelRotationAngle + pan.x * 0.7f) % 360f
+                            }
+                        }
                     }
                 }
                 .pointerInput(resetKey) {
-                    detectTapGestures { offset ->
-                        isAnchored = true
-                        pendingTapCoordinates = offset
-                    }
+                    detectTapGestures(
+                        onTap = { offset ->
+                            isAnchored = true
+                            pendingTapCoordinates = offset
+                        },
+                        onDoubleTap = {
+                            // Factory reset gestures: restore scale, position, and orientation to original
+                            modelScaleMultiplier = 1.0f
+                            modelRotationAngle = 0f
+                            modelPitchAngle = 0f
+                            modelPositionX = 0f
+                            modelPositionY = 0f
+                            currentAnchor = null
+                        }
+                    )
                 }
         )
     }
@@ -943,6 +1031,7 @@ private fun MRViewport(
     ipdMm: Float,
     fovDeg: Float,
     isScaleLocked: Boolean,
+    rotationMode: RotationMode,
     resetKey: Int,
     onFrameRendered: () -> Unit
 ) {
@@ -951,6 +1040,7 @@ private fun MRViewport(
     // Shared gesture state across BOTH eyes in lockstep
     var modelScaleMultiplier by remember(resetKey) { mutableFloatStateOf(1.0f) }
     var modelRotationAngle by remember(resetKey) { mutableFloatStateOf(0f) }
+    var modelPitchAngle by remember(resetKey) { mutableFloatStateOf(0f) }
     var modelPositionX by remember(resetKey) { mutableFloatStateOf(0f) }
     var modelPositionY by remember(resetKey) { mutableFloatStateOf(0f) }
     var isAnchored by remember(resetKey) { mutableStateOf(true) }
@@ -1014,11 +1104,16 @@ private fun MRViewport(
                             } else {
                                 selectedObject.defaultScale * 0.45f * modelScaleMultiplier
                             }
+                            val effectiveRotation = if (rotationMode == RotationMode.X_AXIS) {
+                                Rotation(modelPitchAngle, 0f, 0f)
+                            } else {
+                                Rotation(modelPitchAngle, modelRotationAngle, 0f)
+                            }
                             ModelNode(
                                 modelInstance = instance,
                                 position = Position(modelPositionX, modelPositionY - 0.05f, 0f),
                                 scaleToUnits = effectiveScale,
-                                rotation = Rotation(0f, modelRotationAngle, 0f),
+                                rotation = effectiveRotation,
                                 autoAnimate = true
                             )
                         }
@@ -1065,11 +1160,16 @@ private fun MRViewport(
                             } else {
                                 selectedObject.defaultScale * 0.45f * modelScaleMultiplier
                             }
+                            val effectiveRotation = if (rotationMode == RotationMode.X_AXIS) {
+                                Rotation(modelPitchAngle, 0f, 0f)
+                            } else {
+                                Rotation(modelPitchAngle, modelRotationAngle, 0f)
+                            }
                             ModelNode(
                                 modelInstance = instance,
                                 position = Position(modelPositionX, modelPositionY - 0.05f, 0f),
                                 scaleToUnits = effectiveScale,
-                                rotation = Rotation(0f, modelRotationAngle, 0f),
+                                rotation = effectiveRotation,
                                 autoAnimate = true
                             )
                         }
@@ -1082,7 +1182,7 @@ private fun MRViewport(
         Surface(
             modifier = Modifier
                 .align(Alignment.TopCenter)
-                .padding(top = 80.dp),
+                .padding(top = 110.dp),
             shape = RoundedCornerShape(20.dp),
             color = Color(0xCC0E141E)
         ) {
@@ -1106,24 +1206,46 @@ private fun MRViewport(
             }
         }
 
-        // Gestures Overlay on top: Scaling or rotating scales/rotates BOTH eyes in lockstep
+        // Gestures Overlay on top: 1 finger drag rotates model. 2 fingers pinch scales/magnifies lockstep across both eyes. Moving/panning removed. Double-tap to factory reset.
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .pointerInput(resetKey) {
+                .pointerInput(resetKey, rotationMode) {
                     detectTransformGestures { _, pan, zoom, _ ->
-                        if (!isScaleLocked) {
+                        // 2-finger pinch to scale / magnify
+                        if (!isScaleLocked && zoom != 1.0f) {
                             modelScaleMultiplier = (modelScaleMultiplier * zoom).coerceIn(0.1f, 6.0f)
                         }
-                        modelRotationAngle = (modelRotationAngle + pan.x * 0.5f) % 360f
-                        modelPositionX = (modelPositionX + pan.x * 0.002f).coerceIn(-1.0f, 1.0f)
-                        modelPositionY = (modelPositionY - pan.y * 0.002f).coerceIn(-1.0f, 1.0f)
+                        if (rotationMode == RotationMode.X_AXIS) {
+                            // 1-finger vertical drag rotates model full 360 degrees in lockstep strictly on X axis
+                            if (pan.y != 0f) {
+                                modelPitchAngle = (modelPitchAngle + pan.y * 0.7f) % 360f
+                            }
+                        } else {
+                            // Free Rotate: full 360 degrees in lockstep across both axes
+                            if (pan.y != 0f) {
+                                modelPitchAngle = (modelPitchAngle + pan.y * 0.7f) % 360f
+                            }
+                            if (pan.x != 0f) {
+                                modelRotationAngle = (modelRotationAngle + pan.x * 0.7f) % 360f
+                            }
+                        }
                     }
                 }
                 .pointerInput(resetKey) {
-                    detectTapGestures {
-                        isAnchored = true
-                    }
+                    detectTapGestures(
+                        onTap = {
+                            isAnchored = true
+                        },
+                        onDoubleTap = {
+                            // Factory reset gestures: restore stereoscopic scale and rotation to factory center
+                            modelScaleMultiplier = 1.0f
+                            modelRotationAngle = 0f
+                            modelPitchAngle = 0f
+                            modelPositionX = 0f
+                            modelPositionY = 0f
+                        }
+                    )
                 }
         )
     }
