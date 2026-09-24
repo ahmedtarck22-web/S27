@@ -47,8 +47,18 @@ enum class ViewMode(val label: String) {
 }
 
 enum class RotationMode(val label: String) {
-    FREE("X & Y Axes (Free)"),
+    FREE("X, Y & Z Axes (3D)"),
     X_AXIS("X-Axis Only")
+}
+
+enum class InteractionMode(val label: String, val badgeText: String, val hint: String) {
+    ROTATE_SCALE("Rotate + Scale", "Rotate + Scale", "1-Finger: Rotate (X, Y, Z) • 2-Finger: Pinch to Scale"),
+    MOVE("Move Mode", "Move (Translate)", "2-Finger: Drag to Move Object");
+
+    companion object {
+        val ROTATION get() = ROTATE_SCALE
+        val MOVING get() = MOVE
+    }
 }
 
 val CapsuleBgColor = Color(0xFFCACACC)

@@ -31,10 +31,13 @@ import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -90,9 +93,12 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.input.pointer.PointerInputScope
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.testTag
@@ -115,6 +121,7 @@ import io.github.sceneview.ar.arcore.createAnchorOrNull
 import io.github.sceneview.ar.arcore.getUpdatedPlanes
 import io.github.sceneview.ar.node.AnchorNode
 import io.github.sceneview.demo.ui.components.BottomControlBar
+import io.github.sceneview.demo.ui.components.InteractionMode
 import io.github.sceneview.demo.ui.components.RotationMode
 import io.github.sceneview.demo.ui.components.RotationModeSwitch
 import io.github.sceneview.demo.ui.components.SceneObject
@@ -339,7 +346,9 @@ fun MixedRealityScreen() {
                     isScaleLocked = isScaleLockEnabled,
                     rotationMode = rotationMode,
                     resetKey = resetCounter,
-                    onFrameRendered = { frameCount++ }
+                    onFrameRendered = { frameCount++ },
+                    onLogEvent = { cat, msg -> addLog(cat, msg) },
+                    onBannerMessage = { bannerMessage = it }
                 )
             }
             ViewMode.AR -> {
@@ -361,7 +370,8 @@ fun MixedRealityScreen() {
                         rotationMode = rotationMode,
                         resetKey = resetCounter,
                         onFrameRendered = { frameCount++ },
-                        onLogEvent = { cat, msg -> addLog(cat, msg) }
+                        onLogEvent = { cat, msg -> addLog(cat, msg) },
+                        onBannerMessage = { bannerMessage = it }
                     )
                 }
             }
@@ -385,7 +395,8 @@ fun MixedRealityScreen() {
                         isScaleLocked = isScaleLockEnabled,
                         rotationMode = rotationMode,
                         resetKey = resetCounter,
-                        onFrameRendered = { frameCount++ }
+                        onFrameRendered = { frameCount++ },
+                        onBannerMessage = { bannerMessage = it }
                     )
                 }
             }
@@ -620,6 +631,141 @@ fun MixedRealityScreen() {
 }
 
 /**
+ * Unified 3D model gesture detector:
+ * - Rotation Mode:
+ *   - 1-Finger drag: Rotates model along X and Y axes smoothly.
+ *   - 2-Finger twist / drag: Rotates model along Z-axis (roll) and additional 3D orientation.
+ *   - Zoom / Scale is completely removed as requested.
+ * - Moving Mode:
+ *   - 2-Finger drag: Translates model position in 3D space.
+ * - Double-Tap: Toggles interaction mode between Rotation Mode and Moving Mode (does NOT reset transform).
+ * - Single-Tap: Handles surface hit / placement.
+ */
+private suspend fun PointerInputScope.detect3DModelGestures(
+    onDoubleTapToggle: () -> Unit,
+    onSingleTap: ((Offset) -> Unit)? = null,
+    onRotate: (deltaX: Float, deltaY: Float, deltaZ: Float) -> Unit,
+    onScale: (scaleMultiplier: Float) -> Unit,
+    onTranslate: (deltaX: Float, deltaY: Float, centroid: Offset) -> Unit,
+    getInteractionMode: () -> InteractionMode
+) {
+    var lastTapTime = 0L
+    var lastTapOffset = Offset.Zero
+
+    awaitEachGesture {
+        val down = awaitFirstDown(requireUnconsumed = false)
+        val downTime = System.currentTimeMillis()
+        val downOffset = down.position
+        var hasMovedBeyondSlop = false
+        val touchSlop = viewConfiguration.touchSlop
+
+        var prevCentroid: Offset? = null
+        var prevSpan: Float? = null
+        var prevAngle: Float? = null
+
+        do {
+            val event = awaitPointerEvent()
+            val pressedPointers = event.changes.filter { it.pressed }
+
+            if (pressedPointers.size == 1) {
+                // Reset multi-touch state when moving down to 1 finger
+                prevCentroid = null
+                prevSpan = null
+                prevAngle = null
+
+                val pointer = pressedPointers[0]
+                val currentPos = pointer.position
+                val totalDrag = (currentPos - downOffset).getDistance()
+
+                if (totalDrag > touchSlop) {
+                    hasMovedBeyondSlop = true
+                }
+
+                if (hasMovedBeyondSlop) {
+                    val posChange = pointer.positionChange()
+                    if (posChange != Offset.Zero) {
+                        val mode = getInteractionMode()
+                        if (mode == InteractionMode.ROTATE_SCALE) {
+                            pointer.consume()
+                            // 1-Finger drag rotates X and Y axes
+                            onRotate(posChange.x, posChange.y, 0f)
+                        }
+                    }
+                }
+            } else if (pressedPointers.size >= 2) {
+                hasMovedBeyondSlop = true
+                val p0 = pressedPointers[0]
+                val p1 = pressedPointers[1]
+                val currentP0 = p0.position
+                val currentP1 = p1.position
+                val currentCentroid = (currentP0 + currentP1) / 2f
+                val deltaP = currentP1 - currentP0
+                val currentSpan = deltaP.getDistance()
+                val currentAngle = Math.toDegrees(kotlin.math.atan2(deltaP.y.toDouble(), deltaP.x.toDouble())).toFloat()
+
+                val mode = getInteractionMode()
+                if (mode == InteractionMode.ROTATE_SCALE) {
+                    // MODE 1: ROTATE + SCALE
+                    // Two-finger pinch: scale object smoothly
+                    if (prevSpan != null && prevSpan > 10f && currentSpan > 10f) {
+                        val scaleRatio = currentSpan / prevSpan
+                        if (kotlin.math.abs(scaleRatio - 1.0f) > 0.002f) {
+                            onScale(scaleRatio)
+                        }
+                    }
+                    // Two-finger twist: Z-axis roll
+                    if (prevAngle != null) {
+                        var angleDiff = currentAngle - prevAngle
+                        while (angleDiff > 180f) angleDiff -= 360f
+                        while (angleDiff < -180f) angleDiff += 360f
+                        if (kotlin.math.abs(angleDiff) > 0.1f) {
+                            onRotate(0f, 0f, angleDiff * 0.9f)
+                        }
+                    }
+                    p0.consume()
+                    p1.consume()
+                } else {
+                    // MODE 2: MOVE
+                    // Two-finger drag translates model position in 3D space (no zoom/scale, no rotation)
+                    if (prevCentroid != null) {
+                        val centroidDelta = currentCentroid - prevCentroid
+                        if (centroidDelta != Offset.Zero) {
+                            onTranslate(centroidDelta.x, centroidDelta.y, currentCentroid)
+                        }
+                    } else {
+                        onTranslate(0f, 0f, currentCentroid)
+                    }
+                    p0.consume()
+                    p1.consume()
+                }
+
+                prevCentroid = currentCentroid
+                prevSpan = currentSpan
+                prevAngle = currentAngle
+            }
+        } while (event.changes.any { it.pressed })
+
+        // Pointer released (Up)
+        val upTime = System.currentTimeMillis()
+        if (!hasMovedBeyondSlop && (upTime - downTime) < 320L) {
+            if (lastTapTime > 0L && (upTime - lastTapTime) < 360L && (downOffset - lastTapOffset).getDistance() < touchSlop * 4f) {
+                // Double-Tap: Toggle interaction mode smoothly (no reset!)
+                onDoubleTapToggle()
+                lastTapTime = 0L
+                lastTapOffset = Offset.Zero
+            } else {
+                lastTapTime = upTime
+                lastTapOffset = downOffset
+                onSingleTap?.invoke(downOffset)
+            }
+        } else if (hasMovedBeyondSlop) {
+            lastTapTime = 0L
+            lastTapOffset = Offset.Zero
+        }
+    }
+}
+
+/**
  * 3D Object Viewport: SceneView Filament Scene with orbit, pinch-to-scale, pan,
  * optional grid floor, and auto-rotation.
  */
@@ -636,13 +782,34 @@ private fun ObjectViewport(
     isScaleLocked: Boolean,
     rotationMode: RotationMode,
     resetKey: Int,
-    onFrameRendered: () -> Unit
+    onFrameRendered: () -> Unit,
+    onLogEvent: (String, String) -> Unit,
+    onBannerMessage: (String) -> Unit
 ) {
-    var objectScaleMultiplier by remember(resetKey) { mutableFloatStateOf(1.0f) }
     var objectRotationX by remember(resetKey) { mutableFloatStateOf(0f) }
     var objectRotationY by remember(resetKey) { mutableFloatStateOf(0f) }
+    var objectRotationZ by remember(resetKey) { mutableFloatStateOf(0f) }
     var objectPanX by remember(resetKey) { mutableFloatStateOf(0f) }
     var objectPanY by remember(resetKey) { mutableFloatStateOf(0f) }
+    var objectScaleMultiplier by remember(resetKey) { mutableFloatStateOf(1.0f) }
+    var interactionMode by remember(resetKey) { mutableStateOf(InteractionMode.ROTATE_SCALE) }
+    val haptic = LocalHapticFeedback.current
+
+    fun toggleInteractionMode() {
+        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+        interactionMode = if (interactionMode == InteractionMode.ROTATE_SCALE) {
+            InteractionMode.MOVE
+        } else {
+            InteractionMode.ROTATE_SCALE
+        }
+        val msg = if (interactionMode == InteractionMode.ROTATE_SCALE) {
+            "Mode: Rotate + Scale (1-Finger: Rotate • 2-Finger: Pinch to Zoom)"
+        } else {
+            "Mode: Move (2-Finger: Drag to Move Object)"
+        }
+        onBannerMessage(msg)
+        onLogEvent("GESTURE", "Double-tap toggled mode to ${interactionMode.label}")
+    }
 
     // Auto-rotation effect
     LaunchedEffect(isAutoRotateEnabled) {
@@ -681,19 +848,15 @@ private fun ObjectViewport(
             onFrameRendered()
             if (selectedObject != null) {
                 modelInstance?.let { instance ->
-                    val effectiveScale = if (isScaleLocked) {
-                        selectedObject.defaultScale * 0.35f
-                    } else {
-                        selectedObject.defaultScale * 0.35f * objectScaleMultiplier
-                    }
+                    val effectiveScale = selectedObject.defaultScale * 0.35f * (if (isScaleLocked) 1.0f else objectScaleMultiplier)
                     val effectiveRotation = if (rotationMode == RotationMode.X_AXIS) {
                         Rotation(objectRotationX, 0f, 0f)
                     } else {
-                        Rotation(objectRotationX, objectRotationY, 0f)
+                        Rotation(objectRotationX, objectRotationY, objectRotationZ)
                     }
                     ModelNode(
                         modelInstance = instance,
-                        position = Position(0f, -0.05f, 0f),
+                        position = Position(objectPanX, -0.05f + objectPanY, 0f),
                         scaleToUnits = effectiveScale,
                         rotation = effectiveRotation,
                         autoAnimate = isAnimationPlaying
@@ -718,42 +881,72 @@ private fun ObjectViewport(
             }
         }
 
-        // Gesture Overlay: 1 finger drag rotates model. 2 fingers pinch scales/magnifies. Moving/panning removed.
+        // Top Interaction Mode Chip HUD (Clickable & shows mode)
+        Surface(
+            modifier = Modifier
+                .align(Alignment.TopCenter)
+                .padding(top = 110.dp)
+                .clip(RoundedCornerShape(20.dp))
+                .clickable { toggleInteractionMode() }
+                .testTag("interaction_mode_chip"),
+            shape = RoundedCornerShape(20.dp),
+            color = Color(0xCC0E141E),
+            border = androidx.compose.foundation.BorderStroke(
+                1.dp,
+                if (interactionMode == InteractionMode.ROTATE_SCALE) Color(0xFF00E5FF).copy(alpha = 0.5f) else Color(0xFFFFB300).copy(alpha = 0.5f)
+            )
+        ) {
+            Row(
+                modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(8.dp)
+                        .clip(CircleShape)
+                        .background(if (interactionMode == InteractionMode.ROTATE_SCALE) Color(0xFF00E5FF) else Color(0xFFFFB300))
+                )
+                Text(
+                    text = "${interactionMode.badgeText} • Double-tap to switch",
+                    color = Color(0xFFE2F3FF),
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Medium
+                )
+            }
+        }
+
+        // Gesture Overlay:
+        // - Double-Tap toggles between Rotate+Scale Mode and Move Mode (does NOT reset transform)
+        // - Rotate+Scale Mode: 1-finger drag rotates model (X/Y), 2-finger pinch scales/zooms, 2-finger twist rolls (Z)
+        // - Move Mode: 2-finger drag translates model position in 3D space
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .pointerInput(resetKey, rotationMode) {
-                    detectTransformGestures { _, pan, zoom, _ ->
-                        // 2-finger pinch to scale / magnify
-                        if (!isScaleLocked && zoom != 1.0f) {
-                            objectScaleMultiplier = (objectScaleMultiplier * zoom).coerceIn(0.15f, 5.0f)
-                        }
-                        if (rotationMode == RotationMode.X_AXIS) {
-                            // 1-finger vertical drag rotates model full 360 degrees strictly on the X axis (pitch rotation)
-                            if (pan.y != 0f) {
-                                objectRotationX = (objectRotationX + pan.y * 0.7f) % 360f
+                .pointerInput(resetKey, rotationMode, isScaleLocked) {
+                    detect3DModelGestures(
+                        onDoubleTapToggle = {
+                            toggleInteractionMode()
+                        },
+                        onRotate = { dx, dy, dz ->
+                            if (rotationMode == RotationMode.X_AXIS) {
+                                objectRotationX = (objectRotationX + dy * 0.6f) % 360f
+                            } else {
+                                objectRotationX = (objectRotationX + dy * 0.6f) % 360f
+                                objectRotationY = (objectRotationY + dx * 0.6f) % 360f
+                                objectRotationZ = (objectRotationZ + dz * 0.8f) % 360f
                             }
-                        } else {
-                            // Free Rotate: full 360 degrees on both X (vertical drag) and Y (horizontal drag)
-                            if (pan.y != 0f) {
-                                objectRotationX = (objectRotationX + pan.y * 0.7f) % 360f
+                        },
+                        onScale = { multiplier ->
+                            if (!isScaleLocked) {
+                                objectScaleMultiplier = (objectScaleMultiplier * multiplier).coerceIn(0.2f, 4.5f)
                             }
-                            if (pan.x != 0f) {
-                                objectRotationY = (objectRotationY + pan.x * 0.7f) % 360f
-                            }
-                        }
-                    }
-                }
-                .pointerInput(resetKey) {
-                    detectTapGestures(
-                        onDoubleTap = {
-                            // Factory reset gestures: restore scale to 1.0 and rotation to 0
-                            objectScaleMultiplier = 1.0f
-                            objectRotationX = 0f
-                            objectRotationY = 0f
-                            objectPanX = 0f
-                            objectPanY = 0f
-                        }
+                        },
+                        onTranslate = { dx, dy, _ ->
+                            objectPanX = (objectPanX + dx * 0.003f).coerceIn(-2.5f, 2.5f)
+                            objectPanY = (objectPanY - dy * 0.003f).coerceIn(-2.5f, 2.5f)
+                        },
+                        getInteractionMode = { interactionMode }
                     )
                 }
         )
@@ -761,9 +954,14 @@ private fun ObjectViewport(
 }
 
 /**
- * AR Viewport: Real ARCore tracking with horizontal & vertical plane detection,
- * real anchors, lighting estimation, depth sensing, and touch gesture manipulation.
- * Gracefully degrades to camera pass-through + plane overlay if ARCore is unavailable.
+ * AR Viewport: True world-locked ARCore physical placement system.
+ * - Detects horizontal & vertical planes from real camera feed
+ * - Uses PlacementReticle cursor and frame hitTest on user touch to create real ARCore Anchors
+ * - Attaches 3D model (AnchorNode -> ModelNode) at Position(0,0,0) directly to the physical Anchor
+ * - 1-finger drag rotates model relative to anchor
+ * - 2-finger pinch scales model in place
+ * - Double-tap toggles between ROTATE + SCALE mode and MOVE mode
+ * - 2-finger drag in MOVE mode glides the anchor across the real-world surface via continuous frame hit-testing
  */
 @Composable
 private fun ARViewport(
@@ -777,22 +975,46 @@ private fun ARViewport(
     rotationMode: RotationMode,
     resetKey: Int,
     onFrameRendered: () -> Unit,
-    onLogEvent: (String, String) -> Unit
+    onLogEvent: (String, String) -> Unit,
+    onBannerMessage: (String) -> Unit
 ) {
-    var modelScaleMultiplier by remember(resetKey) { mutableFloatStateOf(1.0f) }
     var modelRotationAngle by remember(resetKey) { mutableFloatStateOf(0f) }
     var modelPitchAngle by remember(resetKey) { mutableFloatStateOf(0f) }
-    var modelPositionX by remember(resetKey) { mutableFloatStateOf(0f) }
-    var modelPositionY by remember(resetKey) { mutableFloatStateOf(0f) }
-    var isAnchored by remember(resetKey) { mutableStateOf(true) }
+    var modelRollAngle by remember(resetKey) { mutableFloatStateOf(0f) }
+    var modelScaleMultiplier by remember(resetKey) { mutableFloatStateOf(1.0f) }
+    var interactionMode by remember(resetKey) { mutableStateOf(InteractionMode.ROTATE_SCALE) }
+    val haptic = LocalHapticFeedback.current
 
-    var arCoreFailed by remember { mutableStateOf(false) }
-    var arCoreErrorMessage by remember { mutableStateOf<String?>(null) }
     var currentAnchor by remember(resetKey) { mutableStateOf<Anchor?>(null) }
     var detectedPlanesCount by remember { mutableIntStateOf(0) }
-    var trackingStatusText by remember { mutableStateOf("Detecting surfaces...") }
+    var trackingStatusText by remember { mutableStateOf("Scanning environment for planes...") }
+    var arCoreErrorMessage by remember { mutableStateOf<String?>(null) }
 
-    var pendingTapCoordinates by remember(resetKey) { mutableStateOf<androidx.compose.ui.geometry.Offset?>(null) }
+    var pendingTapCoordinates by remember(resetKey) { mutableStateOf<Offset?>(null) }
+    var pendingMoveCoordinates by remember(resetKey) { mutableStateOf<Offset?>(null) }
+
+    fun toggleInteractionMode() {
+        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+        interactionMode = if (interactionMode == InteractionMode.ROTATE_SCALE) {
+            InteractionMode.MOVE
+        } else {
+            InteractionMode.ROTATE_SCALE
+        }
+        val msg = if (interactionMode == InteractionMode.ROTATE_SCALE) {
+            "AR Mode: Rotate + Scale (1-Finger: Rotate • 2-Finger: Pinch to Zoom)"
+        } else {
+            "AR Mode: Move (2-Finger: Drag along floor to move object)"
+        }
+        onBannerMessage(msg)
+        onLogEvent("AR", "Double-tap toggled mode to ${interactionMode.label}")
+    }
+
+    DisposableEffect(resetKey) {
+        onDispose {
+            currentAnchor?.detach()
+            currentAnchor = null
+        }
+    }
 
     val modelInstance = remember(selectedObject, resetKey) {
         if (selectedObject == null) null
@@ -803,129 +1025,128 @@ private fun ARViewport(
         } else null
     }
 
-    Box(modifier = Modifier.fillMaxSize()) {
-        if (!arCoreFailed) {
-            // Real ARCore Session using ARSceneView
-            ARSceneView(
-                modifier = Modifier.fillMaxSize(),
-                engine = engine,
-                modelLoader = modelLoader,
-                materialLoader = materialLoader,
-                planeRenderer = true,
-                sessionConfiguration = { _, config ->
-                    config.planeFindingMode = Config.PlaneFindingMode.HORIZONTAL_AND_VERTICAL
-                    runCatching {
-                        config.depthMode = Config.DepthMode.AUTOMATIC
-                    }
-                    config.lightEstimationMode = Config.LightEstimationMode.ENVIRONMENTAL_HDR
-                },
-                onSessionFailed = { exception ->
-                    arCoreFailed = true
-                    arCoreErrorMessage = exception.localizedMessage ?: "ARCore unavailable on this device"
-                    onLogEvent("AR", "ARCore session failed: $arCoreErrorMessage; active camera passthrough mode")
-                },
-                onTrackingFailureChanged = { reason ->
+    BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+        val screenWidthPx = constraints.maxWidth.toFloat()
+        val screenHeightPx = constraints.maxHeight.toFloat()
+        val centerXPx = screenWidthPx / 2f
+        val centerYPx = screenHeightPx / 2f
+
+        // Real ARCore Session using ARSceneView
+        ARSceneView(
+            modifier = Modifier.fillMaxSize(),
+            engine = engine,
+            modelLoader = modelLoader,
+            materialLoader = materialLoader,
+            planeRenderer = true,
+            sessionConfiguration = { _, config ->
+                // Real-time horizontal and vertical plane detection
+                config.planeFindingMode = Config.PlaneFindingMode.HORIZONTAL_AND_VERTICAL
+                config.lightEstimationMode = Config.LightEstimationMode.ENVIRONMENTAL_HDR
+                runCatching {
+                    config.focusMode = Config.FocusMode.AUTO
+                }
+                runCatching {
+                    config.depthMode = Config.DepthMode.AUTOMATIC
+                }
+            },
+            onSessionFailed = { exception ->
+                arCoreErrorMessage = exception.localizedMessage ?: "AR session failed"
+                onLogEvent("AR", "ARCore session failed: $exception")
+            },
+            onTrackingFailureChanged = { reason ->
+                if (reason != null) {
                     trackingStatusText = when (reason) {
                         TrackingFailureReason.EXCESSIVE_MOTION -> "Move device slower"
                         TrackingFailureReason.INSUFFICIENT_LIGHT -> "Low light - move to brighter area"
-                        TrackingFailureReason.INSUFFICIENT_FEATURES -> "Point camera at textured surface"
+                        TrackingFailureReason.INSUFFICIENT_FEATURES -> "Aim camera at textured ground"
                         TrackingFailureReason.CAMERA_UNAVAILABLE -> "Camera sensor busy"
-                        null -> if (detectedPlanesCount > 0) "Surfaces Detected ($detectedPlanesCount planes)" else "Scanning environment..."
                         else -> "Tracking: ${reason.name}"
                     }
-                },
-                onSessionUpdated = { _, frame ->
-                    onFrameRendered()
-                    val planes = frame.getUpdatedPlanes()
-                    detectedPlanesCount = planes.size
+                }
+            },
+            onSessionUpdated = { session, frame ->
+                onFrameRendered()
 
-                    val tap = pendingTapCoordinates
-                    if (tap != null) {
-                        pendingTapCoordinates = null
-                        val hitResults = frame.hitTest(tap.x, tap.y)
-                        val arHit = hitResults.firstOrNull { hit ->
-                            val trackable = hit.trackable
-                            trackable is Plane && trackable.isPoseInPolygon(hit.hitPose)
-                        } ?: hitResults.firstOrNull()
+                val allPlanes = session.getAllTrackables(Plane::class.java).filter { it.trackingState == TrackingState.TRACKING }
+                detectedPlanesCount = allPlanes.size
 
-                        if (arHit != null) {
-                            currentAnchor = arHit.createAnchorOrNull()
-                            onLogEvent("AR", "Placed anchor via tap at trackable surface")
+                val cameraTracking = frame.camera.trackingState
+                trackingStatusText = when {
+                    cameraTracking != TrackingState.TRACKING -> "Scanning environment... Move device slowly"
+                    detectedPlanesCount == 0 -> "Scanning environment • Aim camera at floor or flat surfaces"
+                    currentAnchor == null -> "Surface detected ($detectedPlanesCount planes) • Tap grid to place model"
+                    interactionMode == InteractionMode.MOVE -> "Move Mode • 2-finger drag to glide model on floor"
+                    else -> "Model anchored to ground • 1-finger rotate • 2-finger zoom"
+                }
+
+                // Hit Testing & Anchoring: Convert touch position into real-world Pose & Anchor
+                val tap = pendingTapCoordinates
+                if (tap != null) {
+                    pendingTapCoordinates = null
+                    val hitResults = frame.hitTest(tap.x, tap.y).ifEmpty {
+                        frame.hitTest(centerXPx, centerYPx)
+                    }
+                    val planeHit = hitResults.firstOrNull { hit ->
+                        val trackable = hit.trackable
+                        trackable is Plane && trackable.isPoseInPolygon(hit.hitPose) && trackable.type == Plane.Type.HORIZONTAL_UPWARD_FACING
+                    } ?: hitResults.firstOrNull { hit ->
+                        val trackable = hit.trackable
+                        trackable is Plane && trackable.isPoseInPolygon(hit.hitPose)
+                    } ?: hitResults.firstOrNull { hit ->
+                        val trackable = hit.trackable
+                        trackable is Plane && trackable.trackingState == TrackingState.TRACKING
+                    }
+
+                    if (planeHit != null) {
+                        val newAnchor = runCatching { planeHit.createAnchor() }.getOrNull()
+                        if (newAnchor != null) {
+                            currentAnchor?.detach()
+                            currentAnchor = newAnchor
+                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            onBannerMessage("3D Model Anchored to Ground")
+                            onLogEvent("AR", "Anchored to physical plane at ${planeHit.hitPose.translation.contentToString()}")
                         }
-                    } else if (frame.camera.trackingState == TrackingState.TRACKING && currentAnchor == null) {
-                        val firstPlane = planes.firstOrNull {
-                            it.type == Plane.Type.HORIZONTAL_UPWARD_FACING || it.type == Plane.Type.VERTICAL
-                        }
-                        if (firstPlane != null) {
-                            currentAnchor = firstPlane.createAnchorOrNull(firstPlane.centerPose)
-                            onLogEvent("AR", "Auto-anchored on plane: ${firstPlane.type}")
-                        }
+                    } else {
+                        onBannerMessage("No plane detected at tap location — aim at surface")
                     }
                 }
-            ) {
-                currentAnchor?.let { anchor ->
-                    AnchorNode(anchor = anchor) {
-                        modelInstance?.let { instance ->
-                            val effectiveScale = if (isScaleLocked) {
-                                selectedObject?.defaultScale ?: 0.35f
-                            } else {
-                                (selectedObject?.defaultScale ?: 0.35f) * 0.35f * modelScaleMultiplier
-                            }
-                            val effectiveRotation = if (rotationMode == RotationMode.X_AXIS) {
-                                Rotation(modelPitchAngle, 0f, 0f)
-                            } else {
-                                Rotation(modelPitchAngle, modelRotationAngle, 0f)
-                            }
-                            ModelNode(
-                                modelInstance = instance,
-                                position = Position(modelPositionX, modelPositionY, 0f),
-                                scaleToUnits = effectiveScale,
-                                rotation = effectiveRotation,
-                                autoAnimate = true
-                            )
+
+                // 2-finger drag translation: update anchor location across detected planes in real-time
+                val moveCoords = pendingMoveCoordinates
+                if (moveCoords != null && interactionMode == InteractionMode.MOVE) {
+                    pendingMoveCoordinates = null
+                    val hitResults = frame.hitTest(moveCoords.x, moveCoords.y)
+                    val planeHit = hitResults.firstOrNull { hit ->
+                        val trackable = hit.trackable
+                        trackable is Plane && trackable.isPoseInPolygon(hit.hitPose)
+                    } ?: hitResults.firstOrNull { hit ->
+                        val trackable = hit.trackable
+                        trackable is Plane && trackable.trackingState == TrackingState.TRACKING
+                    }
+
+                    if (planeHit != null) {
+                        val newAnchor = runCatching { planeHit.createAnchor() }.getOrNull()
+                        if (newAnchor != null) {
+                            currentAnchor?.detach()
+                            currentAnchor = newAnchor
                         }
                     }
                 }
             }
-        } else {
-            // Graceful Fallback: Hardware Camera Feed + SceneView on real floor
-            SingleCameraBackground(
-                modifier = Modifier.fillMaxSize(),
-                hasCameraPermission = hasCameraPermission
-            )
-
-            Scene(
-                modifier = Modifier.fillMaxSize(),
-                surfaceType = SurfaceType.TextureSurface,
-                isOpaque = false,
-                engine = engine,
-                modelLoader = modelLoader,
-                materialLoader = materialLoader,
-                environment = environment,
-                mainLightNode = rememberMainLightNode(engine) {
-                    intensity = 110_000f
-                },
-                cameraNode = rememberCameraNode(engine) {
-                    position = Position(0f, 0.1f, 2.2f)
-                    lookAt(Position(0f, 0f, 0f))
-                }
-            ) {
-                onFrameRendered()
-                if (selectedObject != null && isAnchored) {
+        ) {
+            // Real physical ARCore Anchor: model remains strictly fixed to the real-world ground
+            currentAnchor?.let { anchor ->
+                AnchorNode(anchor = anchor) {
                     modelInstance?.let { instance ->
-                        val effectiveScale = if (isScaleLocked) {
-                            selectedObject.defaultScale * 0.35f
-                        } else {
-                            selectedObject.defaultScale * 0.35f * modelScaleMultiplier
-                        }
+                        val effectiveScale = (selectedObject?.defaultScale ?: 0.35f) * 0.35f * (if (isScaleLocked) 1.0f else modelScaleMultiplier)
                         val effectiveRotation = if (rotationMode == RotationMode.X_AXIS) {
                             Rotation(modelPitchAngle, 0f, 0f)
                         } else {
-                            Rotation(modelPitchAngle, modelRotationAngle, 0f)
+                            Rotation(modelPitchAngle, modelRotationAngle, modelRollAngle)
                         }
                         ModelNode(
                             modelInstance = instance,
-                            position = Position(modelPositionX, modelPositionY - 0.05f, 0f),
+                            position = Position(0f, 0f, 0f),
                             scaleToUnits = effectiveScale,
                             rotation = effectiveRotation,
                             autoAnimate = true
@@ -935,80 +1156,133 @@ private fun ARViewport(
             }
         }
 
-        // Top AR Plane Tracking HUD Status Chip
-        Surface(
-            modifier = Modifier
-                .align(Alignment.TopCenter)
-                .padding(top = 110.dp),
-            shape = RoundedCornerShape(20.dp),
-            color = Color(0xCC0E141E)
-        ) {
-            Row(
-                modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
+        // Aiming reticle overlay shown before model is placed
+        if (currentAnchor == null) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.Center)
+                    .size(72.dp),
+                contentAlignment = Alignment.Center
             ) {
-                val chipStatusColor = when {
-                    arCoreFailed -> Color(0xFF00E5FF)
-                    detectedPlanesCount > 0 -> Color(0xFF00E5FF)
-                    else -> Color(0xFFFFB300)
+                val reticleColor = if (detectedPlanesCount > 0) Color(0xFF00E5FF) else Color.White.copy(alpha = 0.5f)
+                Canvas(modifier = Modifier.size(56.dp)) {
+                    drawCircle(
+                        color = reticleColor,
+                        radius = size.minDimension / 2f,
+                        style = androidx.compose.ui.graphics.drawscope.Stroke(width = 2.dp.toPx())
+                    )
+                    drawCircle(
+                        color = reticleColor,
+                        radius = 4.dp.toPx()
+                    )
                 }
-                Box(
-                    modifier = Modifier
-                        .size(8.dp)
-                        .clip(CircleShape)
-                        .background(chipStatusColor)
-                )
-                Text(
-                    text = if (arCoreFailed) "Camera Pass-Through Active" else trackingStatusText,
-                    color = Color(0xFFE2F3FF),
-                    fontSize = 12.sp,
-                    fontWeight = FontWeight.Medium
-                )
             }
         }
 
-        // Gesture Overlay for AR: 1 finger drag rotates model. 2 fingers pinch scales/magnifies. Moving/panning removed. Double-tap to factory reset.
+        // Top AR Plane Tracking HUD Status Chip and Mode Indicator
+        Column(
+            modifier = Modifier
+                .align(Alignment.TopCenter)
+                .padding(top = 110.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            Surface(
+                shape = RoundedCornerShape(20.dp),
+                color = Color(0xCC0E141E)
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    val chipStatusColor = when {
+                        arCoreErrorMessage != null -> Color(0xFFEF4444)
+                        detectedPlanesCount > 0 -> Color(0xFF00E5FF)
+                        else -> Color(0xFFFFB300)
+                    }
+                    Box(
+                        modifier = Modifier
+                            .size(8.dp)
+                            .clip(CircleShape)
+                            .background(chipStatusColor)
+                    )
+                    Text(
+                        text = arCoreErrorMessage?.let { "AR Error: $it" } ?: trackingStatusText,
+                        color = Color(0xFFE2F3FF),
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Medium
+                    )
+                }
+            }
+
+            Surface(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(20.dp))
+                    .clickable { toggleInteractionMode() }
+                    .testTag("ar_interaction_mode_chip"),
+                shape = RoundedCornerShape(20.dp),
+                color = Color(0xCC0E141E),
+                border = androidx.compose.foundation.BorderStroke(
+                    1.dp,
+                    if (interactionMode == InteractionMode.ROTATE_SCALE) Color(0xFF00E5FF).copy(alpha = 0.5f) else Color(0xFFFFB300).copy(alpha = 0.5f)
+                )
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(8.dp)
+                            .clip(CircleShape)
+                            .background(if (interactionMode == InteractionMode.ROTATE_SCALE) Color(0xFF00E5FF) else Color(0xFFFFB300))
+                    )
+                    Text(
+                        text = "${interactionMode.badgeText} • Double-tap to switch",
+                        color = Color(0xFFE2F3FF),
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Medium
+                    )
+                }
+            }
+        }
+
+        // Gesture Overlay for AR:
+        // - Single tap: hit-tests real ARCore plane and anchors/re-anchors model
+        // - Double tap: toggles between Rotate+Scale Mode and Move Mode
+        // - Rotate+Scale Mode: 1-finger drag rotates (X/Y), 2-finger pinch scales, 2-finger twist rolls (Z)
+        // - Move Mode: 2-finger drag moves the anchor across the real AR surface
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .pointerInput(resetKey, rotationMode) {
-                    detectTransformGestures { _, pan, zoom, _ ->
-                        // 2-finger pinch to scale / magnify
-                        if (!isScaleLocked && zoom != 1.0f) {
-                            modelScaleMultiplier = (modelScaleMultiplier * zoom).coerceIn(0.1f, 6.0f)
-                        }
-                        if (rotationMode == RotationMode.X_AXIS) {
-                            // 1-finger vertical drag rotates model full 360 degrees strictly on the X axis
-                            if (pan.y != 0f) {
-                                modelPitchAngle = (modelPitchAngle + pan.y * 0.7f) % 360f
-                            }
-                        } else {
-                            // Free Rotate: full 360 degrees on both axes
-                            if (pan.y != 0f) {
-                                modelPitchAngle = (modelPitchAngle + pan.y * 0.7f) % 360f
-                            }
-                            if (pan.x != 0f) {
-                                modelRotationAngle = (modelRotationAngle + pan.x * 0.7f) % 360f
-                            }
-                        }
-                    }
-                }
-                .pointerInput(resetKey) {
-                    detectTapGestures(
-                        onTap = { offset ->
-                            isAnchored = true
+                .pointerInput(resetKey, rotationMode, isScaleLocked) {
+                    detect3DModelGestures(
+                        onDoubleTapToggle = {
+                            toggleInteractionMode()
+                        },
+                        onSingleTap = { offset ->
                             pendingTapCoordinates = offset
                         },
-                        onDoubleTap = {
-                            // Factory reset gestures: restore scale, position, and orientation to original
-                            modelScaleMultiplier = 1.0f
-                            modelRotationAngle = 0f
-                            modelPitchAngle = 0f
-                            modelPositionX = 0f
-                            modelPositionY = 0f
-                            currentAnchor = null
-                        }
+                        onRotate = { dx, dy, dz ->
+                            if (rotationMode == RotationMode.X_AXIS) {
+                                modelPitchAngle = (modelPitchAngle + dy * 0.5f) % 360f
+                            } else {
+                                modelPitchAngle = (modelPitchAngle + dy * 0.5f) % 360f
+                                modelRotationAngle = (modelRotationAngle - dx * 0.5f) % 360f
+                                modelRollAngle = (modelRollAngle + dz * 0.8f) % 360f
+                            }
+                        },
+                        onScale = { multiplier ->
+                            if (!isScaleLocked) {
+                                modelScaleMultiplier = (modelScaleMultiplier * multiplier).coerceIn(0.1f, 5.0f)
+                            }
+                        },
+                        onTranslate = { _, _, centroid ->
+                            pendingMoveCoordinates = centroid
+                        },
+                        getInteractionMode = { interactionMode }
                     )
                 }
         )
@@ -1033,17 +1307,36 @@ private fun MRViewport(
     isScaleLocked: Boolean,
     rotationMode: RotationMode,
     resetKey: Int,
-    onFrameRendered: () -> Unit
+    onFrameRendered: () -> Unit,
+    onBannerMessage: (String) -> Unit
 ) {
     val halfIpdMeters = (ipdMm / 1000f) / 2.0f
 
     // Shared gesture state across BOTH eyes in lockstep
-    var modelScaleMultiplier by remember(resetKey) { mutableFloatStateOf(1.0f) }
     var modelRotationAngle by remember(resetKey) { mutableFloatStateOf(0f) }
     var modelPitchAngle by remember(resetKey) { mutableFloatStateOf(0f) }
+    var modelRollAngle by remember(resetKey) { mutableFloatStateOf(0f) }
     var modelPositionX by remember(resetKey) { mutableFloatStateOf(0f) }
     var modelPositionY by remember(resetKey) { mutableFloatStateOf(0f) }
+    var modelScaleMultiplier by remember(resetKey) { mutableFloatStateOf(1.0f) }
     var isAnchored by remember(resetKey) { mutableStateOf(true) }
+    var interactionMode by remember(resetKey) { mutableStateOf(InteractionMode.ROTATE_SCALE) }
+    val haptic = LocalHapticFeedback.current
+
+    fun toggleInteractionMode() {
+        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+        interactionMode = if (interactionMode == InteractionMode.ROTATE_SCALE) {
+            InteractionMode.MOVE
+        } else {
+            InteractionMode.ROTATE_SCALE
+        }
+        val msg = if (interactionMode == InteractionMode.ROTATE_SCALE) {
+            "MR Stereo: Rotate + Scale (1-Finger: Rotate • 2-Finger: Pinch to Zoom)"
+        } else {
+            "MR Stereo: Move (2-Finger: Drag to Move Object)"
+        }
+        onBannerMessage(msg)
+    }
 
     val modelInstanceLeft = remember(selectedObject, resetKey) {
         if (selectedObject == null) null
@@ -1099,15 +1392,11 @@ private fun MRViewport(
                     onFrameRendered()
                     if (selectedObject != null && isAnchored) {
                         modelInstanceLeft?.let { instance ->
-                            val effectiveScale = if (isScaleLocked) {
-                                selectedObject.defaultScale * 0.45f
-                            } else {
-                                selectedObject.defaultScale * 0.45f * modelScaleMultiplier
-                            }
+                            val effectiveScale = selectedObject.defaultScale * 0.45f * (if (isScaleLocked) 1.0f else modelScaleMultiplier)
                             val effectiveRotation = if (rotationMode == RotationMode.X_AXIS) {
                                 Rotation(modelPitchAngle, 0f, 0f)
                             } else {
-                                Rotation(modelPitchAngle, modelRotationAngle, 0f)
+                                Rotation(modelPitchAngle, modelRotationAngle, modelRollAngle)
                             }
                             ModelNode(
                                 modelInstance = instance,
@@ -1155,15 +1444,11 @@ private fun MRViewport(
                 ) {
                     if (selectedObject != null && isAnchored) {
                         modelInstanceRight?.let { instance ->
-                            val effectiveScale = if (isScaleLocked) {
-                                selectedObject.defaultScale * 0.45f
-                            } else {
-                                selectedObject.defaultScale * 0.45f * modelScaleMultiplier
-                            }
+                            val effectiveScale = selectedObject.defaultScale * 0.45f * (if (isScaleLocked) 1.0f else modelScaleMultiplier)
                             val effectiveRotation = if (rotationMode == RotationMode.X_AXIS) {
                                 Rotation(modelPitchAngle, 0f, 0f)
                             } else {
-                                Rotation(modelPitchAngle, modelRotationAngle, 0f)
+                                Rotation(modelPitchAngle, modelRotationAngle, modelRollAngle)
                             }
                             ModelNode(
                                 modelInstance = instance,
@@ -1178,73 +1463,102 @@ private fun MRViewport(
             }
         }
 
-        // Top MR Stereoscopic Status Chip
-        Surface(
+        // Top MR Stereoscopic Status Chip and Mode Indicator
+        Column(
             modifier = Modifier
                 .align(Alignment.TopCenter)
                 .padding(top = 110.dp),
-            shape = RoundedCornerShape(20.dp),
-            color = Color(0xCC0E141E)
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(6.dp)
         ) {
-            Row(
-                modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            Surface(
+                shape = RoundedCornerShape(20.dp),
+                color = Color(0xCC0E141E)
             ) {
-                Box(
-                    modifier = Modifier
-                        .size(8.dp)
-                        .clip(CircleShape)
-                        .background(Color(0xFF00E5FF))
+                Row(
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(8.dp)
+                            .clip(CircleShape)
+                            .background(Color(0xFF00E5FF))
+                    )
+                    Text(
+                        text = String.format(Locale.US, "MR Stereo • IPD: %.1fmm • FOV: %.0f°", ipdMm, fovDeg),
+                        color = Color(0xFFE2F3FF),
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Medium
+                    )
+                }
+            }
+
+            Surface(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(20.dp))
+                    .clickable { toggleInteractionMode() }
+                    .testTag("mr_interaction_mode_chip"),
+                shape = RoundedCornerShape(20.dp),
+                color = Color(0xCC0E141E),
+                border = androidx.compose.foundation.BorderStroke(
+                    1.dp,
+                    if (interactionMode == InteractionMode.ROTATE_SCALE) Color(0xFF00E5FF).copy(alpha = 0.5f) else Color(0xFFFFB300).copy(alpha = 0.5f)
                 )
-                Text(
-                    text = String.format(Locale.US, "MR Stereo • IPD: %.1fmm • FOV: %.0f°", ipdMm, fovDeg),
-                    color = Color(0xFFE2F3FF),
-                    fontSize = 12.sp,
-                    fontWeight = FontWeight.Medium
-                )
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(8.dp)
+                            .clip(CircleShape)
+                            .background(if (interactionMode == InteractionMode.ROTATE_SCALE) Color(0xFF00E5FF) else Color(0xFFFFB300))
+                    )
+                    Text(
+                        text = "${interactionMode.badgeText} • Double-tap to switch",
+                        color = Color(0xFFE2F3FF),
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Medium
+                    )
+                }
             }
         }
 
-        // Gestures Overlay on top: 1 finger drag rotates model. 2 fingers pinch scales/magnifies lockstep across both eyes. Moving/panning removed. Double-tap to factory reset.
+        // Gestures Overlay on top:
+        // - Double-tap toggles between Rotate+Scale Mode and Move Mode (does NOT reset transform)
+        // - Rotate+Scale Mode: 1-finger drag rotates (X/Y), 2-finger pinch scales/zooms, 2-finger twist rolls (Z)
+        // - Move Mode: 2-finger drag translates model across both eyes in 3D space
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .pointerInput(resetKey, rotationMode) {
-                    detectTransformGestures { _, pan, zoom, _ ->
-                        // 2-finger pinch to scale / magnify
-                        if (!isScaleLocked && zoom != 1.0f) {
-                            modelScaleMultiplier = (modelScaleMultiplier * zoom).coerceIn(0.1f, 6.0f)
-                        }
-                        if (rotationMode == RotationMode.X_AXIS) {
-                            // 1-finger vertical drag rotates model full 360 degrees in lockstep strictly on X axis
-                            if (pan.y != 0f) {
-                                modelPitchAngle = (modelPitchAngle + pan.y * 0.7f) % 360f
-                            }
-                        } else {
-                            // Free Rotate: full 360 degrees in lockstep across both axes
-                            if (pan.y != 0f) {
-                                modelPitchAngle = (modelPitchAngle + pan.y * 0.7f) % 360f
-                            }
-                            if (pan.x != 0f) {
-                                modelRotationAngle = (modelRotationAngle + pan.x * 0.7f) % 360f
-                            }
-                        }
-                    }
-                }
-                .pointerInput(resetKey) {
-                    detectTapGestures(
-                        onTap = {
-                            isAnchored = true
+                .pointerInput(resetKey, rotationMode, isScaleLocked) {
+                    detect3DModelGestures(
+                        onDoubleTapToggle = {
+                            toggleInteractionMode()
                         },
-                        onDoubleTap = {
-                            // Factory reset gestures: restore stereoscopic scale and rotation to factory center
-                            modelScaleMultiplier = 1.0f
-                            modelRotationAngle = 0f
-                            modelPitchAngle = 0f
-                            modelPositionX = 0f
-                            modelPositionY = 0f
-                        }
+                        onRotate = { dx, dy, dz ->
+                            if (rotationMode == RotationMode.X_AXIS) {
+                                modelPitchAngle = (modelPitchAngle + dy * 0.6f) % 360f
+                            } else {
+                                modelPitchAngle = (modelPitchAngle + dy * 0.6f) % 360f
+                                modelRotationAngle = (modelRotationAngle + dx * 0.6f) % 360f
+                                modelRollAngle = (modelRollAngle + dz * 0.8f) % 360f
+                            }
+                        },
+                        onScale = { multiplier ->
+                            if (!isScaleLocked) {
+                                modelScaleMultiplier = (modelScaleMultiplier * multiplier).coerceIn(0.2f, 4.5f)
+                            }
+                        },
+                        onTranslate = { dx, dy, _ ->
+                            modelPositionX = (modelPositionX + dx * 0.002f).coerceIn(-2.0f, 2.0f)
+                            modelPositionY = (modelPositionY - dy * 0.002f).coerceIn(-2.0f, 2.0f)
+                        },
+                        getInteractionMode = { interactionMode }
                     )
                 }
         )
@@ -1431,6 +1745,55 @@ private fun DiagnosticsDrawer(
                     }
                 }
 
+                // ARCore Plane Tracking & IMU Drift Status
+                if (currentMode == ViewMode.AR) {
+                    item {
+                        Text(
+                            text = "ARCore Tracking & IMU Drift Stabilization",
+                            color = Color(0xFF00BCF4),
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Surface(
+                            shape = RoundedCornerShape(12.dp),
+                            color = Color(0xFF1E202B),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Text("Tracking System", color = Color(0xFF888896), fontSize = 12.sp)
+                                    Text("ARCore VIO + IMU Sensor Fusion", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                                }
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Text("Plane Detection", color = Color(0xFF888896), fontSize = 12.sp)
+                                    Text("Horizontal & Vertical (Active)", color = Color(0xFF00E5FF), fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                                }
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Text("IMU Drift Compensation", color = Color(0xFF888896), fontSize = 12.sp)
+                                    Text("Auto-Stabilized via Plane Anchors", color = Color(0xFF10B981), fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                                }
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Text("Optical Focus", color = Color(0xFF888896), fontSize = 12.sp)
+                                    Text("Continuous Auto-Focus", color = Color(0xFF38BDF8), fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // 1:1 Scale Lock
                 item {
                     Row(
@@ -1567,110 +1930,7 @@ private fun DiagnosticsDrawer(
     }
 }
 
-/**
- * Single hardware camera preview for AR mode pass-through fallback.
- */
-@Composable
-private fun SingleCameraBackground(
-    modifier: Modifier = Modifier,
-    hasCameraPermission: Boolean
-) {
-    if (!hasCameraPermission) {
-        Box(modifier = modifier.background(Color(0xFF0D0D12)))
-        return
-    }
 
-    val context = LocalContext.current
-    var surfaceTexture by remember { mutableStateOf<SurfaceTexture?>(null) }
-
-    DisposableEffect(hasCameraPermission, surfaceTexture) {
-        val st = surfaceTexture ?: return@DisposableEffect onDispose {}
-
-        var cameraDevice: CameraDevice? = null
-        var captureSession: CameraCaptureSession? = null
-
-        val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as? CameraManager
-        if (cameraManager != null && ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
-            try {
-                val cameraId = cameraManager.cameraIdList.firstOrNull { id ->
-                    val characteristics = cameraManager.getCameraCharacteristics(id)
-                    val facing = characteristics.get(CameraCharacteristics.LENS_FACING)
-                    facing == CameraCharacteristics.LENS_FACING_BACK
-                } ?: cameraManager.cameraIdList.firstOrNull()
-
-                if (cameraId != null) {
-                    cameraManager.openCamera(cameraId, object : CameraDevice.StateCallback() {
-                        override fun onOpened(camera: CameraDevice) {
-                            cameraDevice = camera
-                            try {
-                                st.setDefaultBufferSize(1920, 1080)
-                                val surface = Surface(st)
-                                val surfaces = listOf(surface)
-                                @Suppress("DEPRECATION")
-                                camera.createCaptureSession(surfaces, object : CameraCaptureSession.StateCallback() {
-                                    override fun onConfigured(session: CameraCaptureSession) {
-                                        captureSession = session
-                                        try {
-                                            val previewRequestBuilder = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
-                                                addTarget(surface)
-                                                set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
-                                            }
-                                            session.setRepeatingRequest(previewRequestBuilder.build(), null, null)
-                                        } catch (e: Exception) {
-                                            e.printStackTrace()
-                                        }
-                                    }
-
-                                    override fun onConfigureFailed(session: CameraCaptureSession) {}
-                                }, null)
-                            } catch (e: Exception) {
-                                e.printStackTrace()
-                            }
-                        }
-
-                        override fun onDisconnected(camera: CameraDevice) {
-                            camera.close()
-                            cameraDevice = null
-                        }
-
-                        override fun onError(camera: CameraDevice, error: Int) {
-                            camera.close()
-                            cameraDevice = null
-                        }
-                    }, null)
-                }
-            } catch (e: Exception) {
-                e.printStackTrace()
-            }
-        }
-
-        onDispose {
-            try {
-                captureSession?.stopRepeating()
-                captureSession?.close()
-                cameraDevice?.close()
-            } catch (e: Exception) {
-                e.printStackTrace()
-            }
-        }
-    }
-
-    AndroidView(
-        factory = { ctx ->
-            TextureView(ctx).apply {
-                surfaceTextureListener = object : TextureView.SurfaceTextureListener {
-                    override fun onSurfaceTextureAvailable(tex: SurfaceTexture, w: Int, h: Int) {
-                        surfaceTexture = tex
-                    }
-                    override fun onSurfaceTextureSizeChanged(tex: SurfaceTexture, w: Int, h: Int) {}
-                    override fun onSurfaceTextureDestroyed(tex: SurfaceTexture): Boolean = true
-                    override fun onSurfaceTextureUpdated(tex: SurfaceTexture) {}
-                }
-            }
-        },
-        modifier = modifier.fillMaxSize()
-    )
-}
 
 /**
  * Dual hardware camera preview for stereoscopic Mixed Reality pass-through.
